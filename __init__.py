@@ -13,82 +13,143 @@
 # limitations under the License.
 #
 
+# TODO Exceptions should be custom types
+
+from collections import defaultdict, namedtuple
+from enum import Enum
+
 from adapt.intent import IntentBuilder
 from mycroft import MycroftSkill
 from mycroft.messagebus.message import Message
 from mycroft.util.log import LOG
+from mycroft.util.parse import extract_number
 from mycroft.skills.common_iot_skill import \
     _BusKeys, \
     IoTRequest, \
     Thing, \
     Action, \
-    Attribute
-from typing import List
+    Attribute, \
+    State, \
+    IOT_REQUEST_ID
+from typing import List, Dict, DefaultDict
 from uuid import uuid4
 
-IOT_REQUEST_ID = "iot_request_id"
 
-_ACTIONS = [action.name for action in Action]
+_QUERY_ACTIONS = [Action.BINARY_QUERY.name, Action.INFORMATION_QUERY.name]
+_NON_QUERY_ACTIONS = [action.name for action in Action if action.name not in _QUERY_ACTIONS]
 _THINGS = [thing.name for thing in Thing]
 _ATTRIBUTES = [attribute.name for attribute in Attribute]
+_STATES = [state.name for state in State]
 
 
-# TODO Exceptions should be custom types
+class IoTRequestStatus(Enum):
+    POLLING = 0
+    RUNNING = 1
 
-def _handle_iot_request(handler_function):
-    def tracking_intent_handler(self, message):
-        id = str(uuid4())
-        message.data[IOT_REQUEST_ID] = id
-        self._current_requests[id] = []
-        handler_function(self, message)
-        self.schedule_event(self._run,
-                            1,  # TODO make this timeout a setting
-                            data={IOT_REQUEST_ID: id},
-                            name="RunIotRequest")
-    return tracking_intent_handler
+
+SpeechRequest = namedtuple('SpeechRequest', ["utterance", "args", "kwargs"])
+
+
+class TrackedIoTRequest():
+
+    def __init__(
+            self,
+            id: str,
+            status: IoTRequestStatus = IoTRequestStatus.POLLING,
+    ):
+        self.id = id
+        self.status = status
+        self.candidates = []
+        self.speech_requests: DefaultDict[str, List[SpeechRequest]] = defaultdict(list)
 
 
 class SkillIoTControl(MycroftSkill):
 
     def __init__(self):
         MycroftSkill.__init__(self)
-        self._current_requests = dict()
-        self._normalized_to_orginal_word_map = dict()
+        self._current_requests: Dict[str, TrackedIoTRequest] = dict()
+        self._normalized_to_orignal_word_map: Dict[str, str] = dict()
+
+    @property
+    def response_timeout(self):
+        return self.settings.get('response_timeout')
+
+    def _handle_speak(self, message: Message):
+        iot_request_id = message.data.get(IOT_REQUEST_ID)
+
+        skill_id = message.data.get("skill_id")
+
+        utterance = message.data.get("speak")
+        args = message.data.get("speak_args")
+        kwargs = message.data.get("speak_kwargs")
+
+        speech_request = SpeechRequest(utterance, args, kwargs)
+
+        if iot_request_id not in self._current_requests:
+            LOG.warning("Dropping speech request from {skill_id} for"
+                        " {iot_request_id} because we are not currently"
+                        " tracking that iot request. SpeechRequest was"
+                        " {speech_request}".format(
+                skill_id=skill_id,
+                iot_request_id=iot_request_id,
+                speech_request=speech_request
+            ))
+
+        self._current_requests[iot_request_id].speech_requests[skill_id].append(speech_request)
+        LOG.info(self._current_requests[iot_request_id].speech_requests[skill_id])
 
     def initialize(self):
         self.add_event(_BusKeys.RESPONSE, self._handle_response)
         self.add_event(_BusKeys.REGISTER, self._register_words)
+        self.add_event(_BusKeys.SPEAK, self._handle_speak)
         self.bus.emit(Message(_BusKeys.CALL_FOR_REGISTRATION, {}))
 
-        intent = (IntentBuilder('IoTRequestWithEntityOrAction')
+        intent = (IntentBuilder('IoTRequestWithEntityOrThing')
                     .one_of('ENTITY', *_THINGS)
-                    .one_of(*_ACTIONS)
+                    .one_of(*_NON_QUERY_ACTIONS)
                     .optionally('SCENE')
+                    .optionally('TO')
                     .build())
         self.register_intent(intent, self._handle_iot_request)
 
-        intent = (IntentBuilder('IoTRequestWithEntityAndAction')
+        intent = (IntentBuilder('IoTRequestWithEntityAndThing')
                     .require('ENTITY')
                     .one_of(*_THINGS)
-                    .one_of(*_ACTIONS)
+                    .one_of(*_NON_QUERY_ACTIONS)
                     .optionally('SCENE')
+                    .optionally('TO')
                     .build())
         self.register_intent(intent, self._handle_iot_request)
 
-        intent = (IntentBuilder('IoTRequestWithEntityOrActionAndProperty')
+        intent = (IntentBuilder('IoTRequestWithEntityOrThingAndAttribute')
                     .one_of('ENTITY', *_THINGS)
-                    .one_of(*_ACTIONS)
+                    .one_of(*_NON_QUERY_ACTIONS)
                     .one_of(*_ATTRIBUTES)
                     .optionally('SCENE')
+                    .optionally('TO')
                     .build())
         self.register_intent(intent, self._handle_iot_request)
 
-        intent = (IntentBuilder('IoTRequestWithEntityAndActionAndProperty')
+        intent = (IntentBuilder('IoTRequestWithEntityAndThingAndAttribute')
                     .require('ENTITY')
                     .one_of(*_THINGS)
-                    .one_of(*_ACTIONS)
+                    .one_of(*_NON_QUERY_ACTIONS)
                     .one_of(*_ATTRIBUTES)
                     .optionally('SCENE')
+                    .optionally('TO')
+                    .build())
+        self.register_intent(intent, self._handle_iot_request)
+
+        intent = (IntentBuilder('IoTRequestScene')
+                  .require('SCENE')
+                  .one_of(*_NON_QUERY_ACTIONS)
+                  .build())
+        self.register_intent(intent, self._handle_iot_request)
+
+        intent = (IntentBuilder('IoTRequestStateQuery')
+                    .one_of(*_QUERY_ACTIONS)
+                    .one_of(*_THINGS, 'ENTITY')
+                    .one_of(*_STATES, *_ATTRIBUTES)
                     .build())
         self.register_intent(intent, self._handle_iot_request)
 
@@ -98,11 +159,15 @@ class SkillIoTControl(MycroftSkill):
     def _handle_response(self, message: Message):
         id = message.data.get(IOT_REQUEST_ID)
         if not id:
-            raise Exception("No id found!")
-        if not id in self._current_requests:
-            raise Exception("Request is not being tracked."
-                            " This skill may have responded too late.")
-        self._current_requests[id].append(message)
+            LOG.error("No id found in message data. Cannot handle this iot request!")
+            return
+        if id not in self._current_requests:
+            LOG.warning("Request is not being tracked. This skill may have responded too late.")
+            return
+        if self._current_requests[id].status != IoTRequestStatus.POLLING:
+            LOG.warning("Skill responded too late. Request is no longer POLLING.")
+            return
+        self._current_requests[id].candidates.append(message)
 
     def _register_words(self, message: Message):
         type = message.data["type"]
@@ -112,25 +177,56 @@ class SkillIoTControl(MycroftSkill):
             self.register_vocabulary(word, type)
             normalized = _normalize_custom_word(word)
             if normalized != word:
-                self._normalized_to_orginal_word_map[normalized] = word
+                self._normalized_to_orignal_word_map[normalized] = word
                 self.register_vocabulary(normalized, type)
 
     def _run(self, message: Message):
         id = message.data.get(IOT_REQUEST_ID)
-        candidates = self._current_requests.get(id)
+        request = self._current_requests.get(id)
 
-        if candidates is None:
+        if request is None:
             raise Exception("This id is not being tracked!")
+
+        request.status = IoTRequestStatus.RUNNING
+        candidates = request.candidates
 
         if not candidates:
             self.speak_dialog('no.skills.can.handle')
-            return
+        else:
+            winners = self._pick_winners(candidates)
+            for winner in winners:
+                self.bus.emit(Message(
+                    _BusKeys.RUN + winner.data["skill_id"], winner.data))
 
-        del(self._current_requests[id])
-        winners = self._pick_winners(candidates)
-        for winner in winners:
-            self.bus.emit(Message(
-                _BusKeys.RUN + winner.data["skill_id"], winner.data))
+            self.schedule_event(self._speak_or_acknowledge,
+                                self.response_timeout,
+                                data={IOT_REQUEST_ID: id},
+                                name="SpeakOrAcknowledge")
+
+    def _speak_or_acknowledge(self, message: Message):
+        id = message.data.get(IOT_REQUEST_ID)
+        request = self._current_requests.get(id)
+
+        if not request.speech_requests:
+            self.acknowledge()
+        else:
+            skill_id, requests = request.speech_requests.popitem()
+            for utterance, args, kwargs in requests:
+                self.speak(utterance, *args, **kwargs)
+            if request.speech_requests:
+                LOG.info("Ignoring speech requests from {speech_requests}. "
+                         "{skill_id} was the winner."
+                         .format(
+                             speech_requests=request.speech_requests,
+                             skill_id=skill_id))
+
+    def _delete_request(self, message: Message):
+        id = message.data.get(IOT_REQUEST_ID)
+        LOG.info("Delete request {id}".format(id=id))
+        try:
+            del(self._current_requests[id])
+        except KeyError:
+            pass
 
     def _pick_winners(self, candidates: List[Message]):
         # TODO - make this actually pick winners
@@ -142,39 +238,73 @@ class SkillIoTControl(MycroftSkill):
                 return e
         return None
 
-    @_handle_iot_request
     def _handle_iot_request(self, message: Message):
+        id = str(uuid4())
+        message.data[IOT_REQUEST_ID] = id
+        self._current_requests[id] = TrackedIoTRequest(id)
+
         data = self._clean_power_request(message.data)
         action = self._get_enum_from_data(Action, data)
         thing = self._get_enum_from_data(Thing, data)
         attribute = self._get_enum_from_data(Attribute, data)
+        state = self._get_enum_from_data(State, data)
         entity = data.get('ENTITY')
         scene = data.get('SCENE')
-        original_entity = (self._normalized_to_orginal_word_map.get(entity)
+        value = None
+
+        if action == Action.SET and 'TO' in data:
+            value = extract_number(message.data['utterance'])
+            # extract_number may return False:
+            value = value if value is not False else None
+
+        original_entity = (self._normalized_to_orignal_word_map.get(entity)
                            if entity else None)
-        original_scene = (self._normalized_to_orginal_word_map.get(scene)
+        original_scene = (self._normalized_to_orignal_word_map.get(scene)
                           if scene else None)
 
-        self._trigger_iot_request(data, action, thing, attribute, entity, scene)
+        self._trigger_iot_request(
+            data,
+            action,
+            thing,
+            attribute,
+            entity,
+            scene,
+            value,
+            state
+        )
 
         if original_entity or original_scene:
             self._trigger_iot_request(data, action, thing, attribute,
-                                      original_entity, original_scene)
+                                      original_entity or entity,
+                                      original_scene or scene,
+                                      state)
 
-        self._set_context(thing, entity, data)
+        self.schedule_event(self._delete_request,
+                            10 * self.response_timeout,
+                            data={IOT_REQUEST_ID: id},
+                            name="DeleteRequest")
+        self.schedule_event(self._run,
+                            self.response_timeout,
+                            data={IOT_REQUEST_ID: id},
+                            name="RunIotRequest")
 
     def _trigger_iot_request(self, data: dict,
                              action: Action,
                              thing: Thing=None,
                              attribute: Attribute=None,
                              entity: str=None,
-                             scene: str=None):
+                             scene: str=None,
+                             value: int=None,
+                             state: State=None):
+        LOG.info('state is {}'.format(state))
         request = IoTRequest(
             action=action,
             thing=thing,
             attribute=attribute,
             entity=entity,
-            scene=scene
+            scene=scene,
+            value=value,
+            state=state
         )
 
         LOG.info("Looking for handlers for: {request}".format(request=request))
